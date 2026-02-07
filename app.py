@@ -27,15 +27,16 @@ def encode_image_to_base64(image_path: str) -> str:
         return base64.standard_b64encode(f.read()).decode("utf-8")
 
 
-def build_sample_images(image_path: str) -> list[dict]:
-    """Convert an uploaded image to the format Browser Use expects."""
-    b64 = encode_image_to_base64(image_path)
-    ext = image_path.rsplit(".", 1)[-1].lower()
+def build_sample_images(image_paths: list[str]) -> list[dict]:
+    """Convert uploaded images to the format Browser Use expects."""
     media_types = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
-    media_type = media_types.get(ext, "image/png")
-    return [
-        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-    ]
+    images = []
+    for path in image_paths:
+        b64 = encode_image_to_base64(path)
+        ext = path.rsplit(".", 1)[-1].lower()
+        media_type = media_types.get(ext, "image/png")
+        images.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}})
+    return images
 
 
 # Shared state for the running agent
@@ -62,7 +63,7 @@ def step_callback(browser_state, agent_output, step_number):
 step_callback.messages = []
 
 
-async def run_agent_task(task: str, image_path: str | None, headless: bool):
+async def run_agent_task(task: str, image_paths: list[str], headless: bool):
     """Run a Browser Use agent and yield progress updates."""
     global current_agent, should_stop
     should_stop = False
@@ -78,8 +79,8 @@ async def run_agent_task(task: str, image_path: str | None, headless: bool):
         "browser_profile": BrowserProfile(headless=headless),
     }
 
-    if image_path:
-        agent_kwargs["sample_images"] = build_sample_images(image_path)
+    if image_paths:
+        agent_kwargs["sample_images"] = build_sample_images(image_paths)
 
     current_agent = Agent(**agent_kwargs)
 
@@ -101,22 +102,25 @@ def stop_agent():
     return gr.update(interactive=False, value="Stopping...")
 
 
-def respond(message: str, image, chat_history: list, headless: bool):
+def respond(message: str, files, chat_history: list, headless: bool):
     """Handle user message — run the agent and stream progress."""
-    if not message.strip():
-        return chat_history, "", None
+    stop_reset = gr.update(value="Stop", interactive=True)
 
-    image_path = image if isinstance(image, str) else None
+    if not message.strip():
+        return chat_history, "", None, stop_reset
+
+    # gr.File returns a list of file paths (or None)
+    image_paths = [f.name if hasattr(f, "name") else f for f in files] if files else []
 
     # Add user message to history
     user_msg = message
-    if image_path:
-        user_msg += "\n\n(Image attached)"
+    if image_paths:
+        user_msg += f"\n\n({len(image_paths)} image{'s' if len(image_paths) != 1 else ''} attached)"
     chat_history = chat_history + [{"role": "user", "content": user_msg}]
 
     # Add a placeholder for assistant response
     chat_history = chat_history + [{"role": "assistant", "content": "Starting agent..."}]
-    yield chat_history, "", None
+    yield chat_history, "", None, gr.update()
 
     # Run the agent in a background thread so we can stream updates
     loop = asyncio.new_event_loop()
@@ -124,7 +128,7 @@ def respond(message: str, image, chat_history: list, headless: bool):
 
     def run_in_thread():
         result_holder[0] = loop.run_until_complete(
-            run_agent_task(message, image_path, headless)
+            run_agent_task(message, image_paths, headless)
         )
 
     thread = threading.Thread(target=run_in_thread)
@@ -138,21 +142,21 @@ def respond(message: str, image, chat_history: list, headless: bool):
             progress = "\n\n".join(step_callback.messages)
             chat_history[-1] = {"role": "assistant", "content": progress + "\n\n_Working..._"}
             seen = len(step_callback.messages)
-            yield chat_history, "", None
+            yield chat_history, "", None, gr.update()
 
-    # Final result
+    # Final result — reset the Stop button
     progress = "\n\n".join(step_callback.messages) if step_callback.messages else ""
     separator = "\n\n---\n\n" if progress else ""
     final_text = result_holder[0] or "No result."
     chat_history[-1] = {"role": "assistant", "content": f"{progress}{separator}**Result:** {final_text}"}
-    yield chat_history, "", None
+    yield chat_history, "", None, stop_reset
 
 
 EXAMPLES = [
-    "Go to google.com and search for 'best CRM for small business 2026'. List the top 5 results.",
-    "Go to linkedin.com and find 3 companies hiring for B2B sales in Amsterdam.",
-    "Go to amazon.com and find the cheapest wireless mouse with 4+ star rating.",
-    "Go to news.ycombinator.com and tell me the top 3 stories right now.",
+    ("Search top CRMs", "Go to google.com and search for 'best CRM for small business 2026'. List the top 5 results."),
+    ("B2B sales jobs", "Go to linkedin.com and find 3 companies hiring for B2B sales in Amsterdam."),
+    ("Cheap wireless mouse", "Go to amazon.com and find the cheapest wireless mouse with 4+ star rating."),
+    ("Hacker News top 3", "Go to news.ycombinator.com and tell me the top 3 stories right now."),
 ]
 
 
@@ -168,6 +172,7 @@ with gr.Blocks(title="Browser Use AI Agent") as app:
         with gr.Column(scale=4):
             chatbot = gr.Chatbot(
                 height=500,
+                show_label=False,
                 placeholder="Type a task and press Enter...",
             )
 
@@ -175,33 +180,37 @@ with gr.Blocks(title="Browser Use AI Agent") as app:
                 msg = gr.Textbox(
                     placeholder="e.g. Go to google.com and find the best rated coffee machine under $100",
                     show_label=False,
-                    scale=4,
+                    scale=6,
                     container=False,
                 )
+                send_btn = gr.Button("Send", variant="primary", scale=1, min_width=80)
                 stop_btn = gr.Button("Stop", variant="stop", scale=1, min_width=80)
 
-            image_input = gr.Image(
-                label="Attach image (optional — e.g. screenshot of what you want the AI to interact with)",
-                type="filepath",
-                height=100,
+            image_input = gr.File(
+                label="Drop images here or click to upload",
+                file_count="multiple",
+                file_types=["image"],
+                height=120,
+                elem_id="image-drop",
             )
 
-        with gr.Column(scale=1, min_width=200):
+        with gr.Column(scale=1, min_width=220):
             gr.Markdown("### Settings")
             headless = gr.Checkbox(label="Run browser in background", value=False)
 
             gr.Markdown("### Quick Tasks")
-            for ex in EXAMPLES:
-                short_label = ex[:60] + "..." if len(ex) > 60 else ex
-                btn = gr.Button(short_label, size="sm")
-                btn.click(set_example, inputs=[gr.State(ex)], outputs=[msg])
+            for label, task in EXAMPLES:
+                btn = gr.Button(label, size="sm")
+                btn.click(set_example, inputs=[gr.State(task)], outputs=[msg])
 
     # Wire events
-    msg.submit(
-        respond,
+    submit_args = dict(
+        fn=respond,
         inputs=[msg, image_input, chatbot, headless],
-        outputs=[chatbot, msg, image_input],
+        outputs=[chatbot, msg, image_input, stop_btn],
     )
+    msg.submit(**submit_args)
+    send_btn.click(**submit_args)
     stop_btn.click(stop_agent, outputs=[stop_btn])
 
 
@@ -210,5 +219,16 @@ if __name__ == "__main__":
         inbrowser=True,
         css="""
         footer { display: none !important; }
+        .chatbot-container .label-wrap { display: none !important; }
+        #image-drop {
+            border: 2px dashed #666 !important;
+            border-radius: 10px !important;
+            background: rgba(255,255,255,0.03) !important;
+            transition: border-color 0.2s, background 0.2s;
+        }
+        #image-drop:hover {
+            border-color: #4a9eff !important;
+            background: rgba(74,158,255,0.06) !important;
+        }
         """,
     )
